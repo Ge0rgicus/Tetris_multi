@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tetris Multiplayer</title>
+    <style>
+        body { background: #111; margin: 0; padding: 20px; font-family: monospace; color: white; }
+        #lobby { display: flex; flex-direction: column; align-items: center; gap: 16px; margin-top: 80px; }
+        #lobby h1 { font-size: 32px; letter-spacing: 4px; }
+        #lobby input { padding: 10px; font-size: 18px; font-family: monospace; background: #222; color: white; border: 1px solid #555; width: 200px; text-align: center; }
+        #lobby button { padding: 10px 24px; font-size: 16px; font-family: monospace; background: #333; color: white; border: 1px solid #555; cursor: pointer; }
+        #lobby button:hover { background: #444; }
+        #roomCode { font-size: 28px; letter-spacing: 6px; color: cyan; }
+        #status { color: #aaa; font-size: 14px; }
+        #game { display: none; gap: 30px; align-items: flex-start; }
+        .board-wrap { display: flex; flex-direction: column; }
+        .board-wrap span { font-size: 18px; margin-bottom: 6px; }
+    </style>
+</head>
+<body>
+
+<!-- LOBBY -->
+<div id="lobby">
+    <h1>TETRIS</h1>
+    <button id="btnCreate">Create Room</button>
+    <div style="display:flex; gap:10px;">
+        <input id="joinInput" placeholder="ROOM CODE" maxlength="6" />
+        <button id="btnJoin">Join</button>
+    </div>
+    <div id="roomCode"></div>
+    <div id="status"></div>
+</div>
+
+<!-- GAME -->
+<div id="game">
+    <div class="board-wrap">
+        <span>YOU &nbsp; SCORE: <span id="myScore">0</span></span>
+        <canvas id="myCanvas" width="350" height="700"></canvas>
+    </div>
+    <div class="board-wrap">
+        <span>OPPONENT &nbsp; SCORE: <span id="oppScore">0</span></span>
+        <canvas id="oppCanvas" width="350" height="700"></canvas>
+    </div>
+</div>
+
+<script type="module">
+import { initializeApp }         from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getDatabase, ref, set, onValue, update, get }
+                                  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+
+const firebaseConfig = {
+    apiKey: "AIzaSyCORiFiXLhrhN7AMjMqM2mCitJD9p3a210",
+    authDomain: "tetris-multi-2148b.firebaseapp.com",
+    databaseURL: "https://tetris-multi-2148b-default-rtdb.firebaseio.com",
+    projectId: "tetris-multi-2148b",
+    storageBucket: "tetris-multi-2148b.firebasestorage.app",
+    messagingSenderId: "883438009874",
+    appId: "1:883438009874:web:0d67772696393cecd5a2cb"
+};
+
+const app = initializeApp(firebaseConfig);
+const db  = getDatabase(app);
+
+// ---- CONSTANTS ----
+const cellSize = 35;
+const TETROMINOES = {
+    I: [[1,1,1,1]],
+    O: [[1,1],[1,1]],
+    T: [[0,1,0],[1,1,1]],
+    L: [[1,0,0],[1,1,1]],
+    J: [[0,0,1],[1,1,1]],
+    S: [[0,1,1],[1,1,0]],
+    Z: [[1,1,0],[0,1,1]]
+};
+const COLORS = { I:"cyan", O:"yellow", T:"purple", L:"orange", J:"blue", S:"green", Z:"red" };
+const WEIGHTS = [-0.7173742371911298,-0.8620685821244413,-0.2690727016603114,-0.011652062884397019,-0.06754924688885461];
+
+// ---- STATE ----
+let myRole = null;   // "host" or "guest"
+let roomId = null;
+let gameStarted = false;
+
+// ---- LOBBY ----
+function randCode() {
+    return Math.random().toString(36).substring(2, 8).toUpperCase();
+}
+
+document.getElementById("btnCreate").onclick = async () => {
+    roomId = randCode();
+    myRole = "host";
+    document.getElementById("roomCode").textContent = roomId;
+    document.getElementById("status").textContent = "Waiting for opponent...";
+    await set(ref(db, `rooms/${roomId}`), { host: "waiting", guest: "waiting", hostBoard: null, guestBoard: null });
+    // Watch for guest joining
+    onValue(ref(db, `rooms/${roomId}/guest`), snap => {
+        if (snap.val() === "ready" && !gameStarted) startGame();
+    });
+    // Mark host ready
+    await update(ref(db, `rooms/${roomId}`), { host: "ready" });
+};
+
+document.getElementById("btnJoin").onclick = async () => {
+    roomId = document.getElementById("joinInput").value.trim().toUpperCase();
+    if (!roomId) return;
+    const snap = await get(ref(db, `rooms/${roomId}`));
+    if (!snap.exists()) { document.getElementById("status").textContent = "Room not found."; return; }
+    myRole = "guest";
+    document.getElementById("status").textContent = "Joining...";
+    await update(ref(db, `rooms/${roomId}`), { guest: "ready" });
+    startGame();
+};
+
+// ---- GAME SETUP ----
+function startGame() {
+    gameStarted = true;
+    document.getElementById("lobby").style.display = "none";
+    document.getElementById("game").style.display = "flex";
+
+    const myCanvas  = document.getElementById("myCanvas");
+    const oppCanvas = document.getElementById("oppCanvas");
+    const myCtx     = myCanvas.getContext("2d");
+    const oppCtx    = oppCanvas.getContext("2d");
+    const myScoreEl  = document.getElementById("myScore");
+    const oppScoreEl = document.getElementById("oppScore");
+
+    const myBoardRef  = ref(db, `rooms/${roomId}/${myRole === "host" ? "hostBoard" : "guestBoard"}`);
+    const oppBoardRef = ref(db, `rooms/${roomId}/${myRole === "host" ? "guestBoard" : "hostBoard"}`);
+
+    // ---- GAME LOGIC ----
+    const board = [];
+    for (let r = 0; r < 20; r++) board.push(new Array(10).fill(0));
+
+    let score = 0;
+    let lockDelay = 0;
+    const LOCK_TIME = 500;
+    let aiEnabled = false;
+    let fallSpeed = 500;
+    let lastTime = 0;
+    let startTime = null;
+
+    function randomPiece() {
+        const keys = Object.keys(TETROMINOES);
+        const rand = keys[Math.floor(Math.random() * keys.length)];
+        return { shape: JSON.parse(JSON.stringify(TETROMINOES[rand])), color: COLORS[rand] };
+    }
+
+    let currentPiece = randomPiece();
+    let pieceX = 3, pieceY = 0;
+
+    function drawBoard(ctx, b) {
+        for (let r = 0; r < 20; r++) {
+            for (let c = 0; c < 10; c++) {
+                ctx.fillStyle = b[r][c] !== 0 ? b[r][c] : "#222";
+                ctx.fillRect(c * cellSize, r * cellSize, cellSize, cellSize);
+            }
+        }
+    }
+
+    function drawPiece(ctx, piece, x, y) {
+        for (let r = 0; r < piece.shape.length; r++) {
+            for (let c = 0; c < piece.shape[r].length; c++) {
+                if (piece.shape[r][c] === 1) {
+                    ctx.fillStyle = piece.color;
+                    ctx.fillRect((x + c) * cellSize, (y + r) * cellSize, cellSize, cellSize);
+                }
+            }
+        }
+    }
+
+    function rotate(shape) {
+        const rows = shape.length, cols = shape[0].length;
+        const rotated = [];
+        for (let c = 0; c < cols; c++) {
+            rotated[c] = [];
+            for (let r = rows - 1; r >= 0; r--) rotated[c].push(shape[r][c]);
+        }
+        return rotated;
+    }
+
+    function canPlace(shape, x, y) {
+        for (let r = 0; r < shape.length; r++)
+            for (let c = 0; c < shape[r].length; c++)
+                if (shape[r][c] === 1) {
+                    if (x+c < 0 || x+c >= 10) return false;
+                    if (y+r < 0 || y+r >= 20) return false;
+                    if (board[y+r][x+c] !== 0) return false;
+                }
+        return true;
+    }
+
+    function willCollide(shape, x, y) {
+        for (let r = 0; r < shape.length; r++)
+            for (let c = 0; c < shape[r].length; c++)
+                if (shape[r][c] === 1) {
+                    if (y+r+1 >= 20) return true;
+                    if (board[y+r+1][x+c] !== 0) return true;
+                }
+        return false;
+    }
+
+    function lockPiece(shape, x, y, color) {
+        for (let r = 0; r < shape.length; r++)
+            for (let c = 0; c < shape[r].length; c++)
+                if (shape[r][c] === 1) board[y+r][x+c] = color;
+    }
+
+    function clearLines() {
+        let cleared = 0;
+        for (let r = 0; r < 20; r++) {
+            if (board[r].every(cell => cell !== 0)) {
+                board.splice(r, 1);
+                board.unshift(new Array(10).fill(0));
+                cleared++;
+            }
+        }
+        if (cleared > 0) {
+            score += [0,100,300,500,800][cleared] || cleared * 100;
+            myScoreEl.textContent = score;
+        }
+    }
+
+    function pushBoard() {
+        set(myBoardRef, { board: board.map(r => r.join(",")), score });
+    }
+
+    function resetPiece() {
+        currentPiece = randomPiece();
+        pieceX = 3; pieceY = 0;
+        if (!canPlace(currentPiece.shape, pieceX, pieceY)) {
+            alert("Game Over! Score: " + score);
+            location.reload();
+        } else {
+            if (aiEnabled) aiDecideMove();
+        }
+    }
+
+    // ---- AI ----
+    function getRotations(shape) {
+        const seen = new Set(), result = [];
+        let cur = shape;
+        for (let i = 0; i < 4; i++) {
+            const key = JSON.stringify(cur);
+            if (!seen.has(key)) { seen.add(key); result.push(JSON.parse(JSON.stringify(cur))); }
+            cur = rotate(cur);
+        }
+        return result;
+    }
+
+    function willCollideAt(shape, x, y) {
+        for (let r = 0; r < shape.length; r++)
+            for (let c = 0; c < shape[r].length; c++)
+                if (shape[r][c] === 1) {
+                    if (y+r+1 >= 20) return true;
+                    if (board[y+r+1] && board[y+r+1][x+c] !== 0) return true;
+                }
+        return false;
+    }
+
+    function dropY(shape, x) {
+        let y = 0;
+        while (!willCollideAt(shape, x, y)) y++;
+        return y;
+    }
+
+    function getFeatures(simBoard) {
+        const WIDTH = 10, HEIGHT = 20;
+        const heights = [];
+        let holes = 0;
+        for (let c = 0; c < WIDTH; c++) {
+            let colHeight = 0, seenBlock = false;
+            for (let r = 0; r < HEIGHT; r++) {
+                if (simBoard[r][c] !== 0) { if (!seenBlock) { colHeight = HEIGHT - r; seenBlock = true; } }
+                else if (seenBlock) holes++;
+            }
+            heights.push(colHeight);
+        }
+        const aggregateHeight = heights.reduce((a,b) => a+b, 0);
+        let bumpiness = 0;
+        for (let i = 0; i < WIDTH-1; i++) bumpiness += Math.abs(heights[i]-heights[i+1]);
+        const avgH = aggregateHeight / WIDTH;
+        const heightVariance = heights.reduce((s,h) => s+(h-avgH)**2, 0);
+        let wells = 0;
+        for (let c = 0; c < WIDTH; c++) {
+            const left = c > 0 ? heights[c-1] : 999;
+            const right = c < WIDTH-1 ? heights[c+1] : 999;
+            if (heights[c] < left && heights[c] < right) wells += Math.min(left,right)-heights[c];
+        }
+        return [aggregateHeight, holes, bumpiness, heightVariance, wells];
+    }
+
+    function scoreFeatures(features) {
+        return WEIGHTS.reduce((s,w,i) => s + w*features[i], 0);
+    }
+
+    function simulatePlacement(shape, x, y, color) {
+        const sim = board.map(row => row.slice());
+        for (let r = 0; r < shape.length; r++)
+            for (let c = 0; c < shape[r].length; c++)
+                if (shape[r][c] === 1) sim[y+r][x+c] = color;
+        let filtered = sim.filter(row => row.some(cell => cell === 0));
+        while (filtered.length < 20) filtered.unshift(new Array(10).fill(0));
+        return filtered;
+    }
+
+    function aiDecideMove() {
+        const rotations = getRotations(currentPiece.shape);
+        let bestScore = -Infinity, bestPlacement = null;
+        for (const shape of rotations) {
+            const pw = shape[0].length;
+            for (let x = 0; x <= 10-pw; x++) {
+                if (!canPlace(shape, x, 0)) continue;
+                const y = dropY(shape, x);
+                if (!canPlace(shape, x, y)) continue;
+                const simBoard = simulatePlacement(shape, x, y, currentPiece.color);
+                const s = scoreFeatures(getFeatures(simBoard));
+                if (s > bestScore) { bestScore = s; bestPlacement = { shape, x, y }; }
+            }
+        }
+        if (bestPlacement) { currentPiece.shape = bestPlacement.shape; pieceX = bestPlacement.x; }
+    }
+
+    // ---- GAME LOOP ----
+    function gameLoop(delta) {
+        const shape = currentPiece.shape;
+        if (willCollide(shape, pieceX, pieceY)) {
+            lockDelay += delta;
+            if (lockDelay > LOCK_TIME) {
+                lockPiece(shape, pieceX, pieceY, currentPiece.color);
+                clearLines();
+                pushBoard();
+                resetPiece();
+                lockDelay = 0;
+            }
+        } else {
+            lockDelay = 0;
+            pieceY++;
+        }
+        myCtx.clearRect(0, 0, myCanvas.width, myCanvas.height);
+        drawBoard(myCtx, board);
+        drawPiece(myCtx, currentPiece, pieceX, pieceY);
+    }
+
+    // ---- OPPONENT BOARD LISTENER ----
+    onValue(oppBoardRef, snap => {
+        const data = snap.val();
+        if (!data) return;
+        const oppBoard = data.board.map(r => r.split(",").map(v => v === "0" ? 0 : v));
+        oppCtx.clearRect(0, 0, oppCanvas.width, oppCanvas.height);
+        drawBoard(oppCtx, oppBoard);
+        oppScoreEl.textContent = data.score || 0;
+    });
+
+    // ---- KEYS ----
+    document.addEventListener("keydown", (e) => {
+        if (e.altKey && e.shiftKey && e.key === "B") {
+            aiEnabled = !aiEnabled;
+            if (aiEnabled) aiDecideMove();
+            return;
+        }
+        if (aiEnabled) return;
+        if (e.key === "ArrowDown") { if (!willCollide(currentPiece.shape, pieceX, pieceY+1)) pieceY++; }
+        if (e.key === "ArrowUp") {
+            const rot = rotate(currentPiece.shape);
+            if (canPlace(rot, pieceX, pieceY)) currentPiece.shape = rot;
+            else if (canPlace(rot, pieceX+1, pieceY)) { pieceX++; currentPiece.shape = rot; }
+            else if (canPlace(rot, pieceX-1, pieceY)) { pieceX--; currentPiece.shape = rot; }
+        }
+        if (e.key === "ArrowLeft")  { if (canPlace(currentPiece.shape, pieceX-1, pieceY)) pieceX--; }
+        if (e.key === "ArrowRight") { if (canPlace(currentPiece.shape, pieceX+1, pieceY)) pieceX++; }
+        myCtx.clearRect(0, 0, myCanvas.width, myCanvas.height);
+        drawBoard(myCtx, board);
+        drawPiece(myCtx, currentPiece, pieceX, pieceY);
+    });
+
+    // ---- UPDATE LOOP ----
+    function update(time = 0) {
+        if (startTime === null) startTime = time;
+        const delta = time - lastTime;
+        const elapsed = time - startTime;
+        if (delta > fallSpeed) {
+            gameLoop(delta);
+            lastTime = time;
+        }
+        fallSpeed = Math.max(80, 500 - Math.floor(elapsed / 5000) * 60);
+        requestAnimationFrame(update);
+    }
+
+    update();
+}
+</script>
+</body>
+</html>
