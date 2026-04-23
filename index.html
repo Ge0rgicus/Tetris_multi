@@ -227,7 +227,27 @@ function startGame() {
         if (cleared > 0) {
             score += [0,100,300,500,800][cleared] || cleared * 100;
             myScoreEl.textContent = score;
+            // Send garbage to opponent (cleared - 1 lines, min 1 for doubles+)
+            const garbage = cleared - 1;
+            if (garbage > 0) {
+                const garbageRef = ref(db, `rooms/${roomId}/${myRole === "host" ? "guestGarbage" : "hostGarbage"}`);
+                set(garbageRef, { lines: garbage, ts: Date.now() });
+            }
         }
+    }
+
+    function receiveGarbage(lines) {
+        // Remove top rows, push garbage up from bottom
+        for (let i = 0; i < lines; i++) {
+            board.shift();
+            // Garbage row: full except one random hole
+            const hole = Math.floor(Math.random() * 10);
+            const garbageRow = new Array(10).fill("gray");
+            garbageRow[hole] = 0;
+            board.push(garbageRow);
+        }
+        // Push piece up if it now overlaps
+        while (!canPlace(currentPiece.shape, pieceX, pieceY) && pieceY > 0) pieceY--;
     }
 
     function pushBoard() {
@@ -381,6 +401,16 @@ function startGame() {
         const overlay = document.getElementById("overlay");
         if (overlay.style.display === "flex") return; // already showing
         if (loser !== myRole) showOverlay("YOU WIN! 🎉");
+    });
+
+    // ---- LISTEN FOR GARBAGE ----
+    const myGarbageRef = ref(db, `rooms/${roomId}/${myRole === "host" ? "hostGarbage" : "guestGarbage"}`);
+    let lastGarbageTs = 0;
+    onValue(myGarbageRef, snap => {
+        const data = snap.val();
+        if (!data || data.ts === lastGarbageTs) return;
+        lastGarbageTs = data.ts;
+        receiveGarbage(data.lines);
     });
 
     // ---- KEYS ----
